@@ -218,6 +218,35 @@ The earlier revision of this document treated case 1 vs case 2 as a genuine trad
 
 **Case 1 is the recommendation, and there is no configuration at 60 Hz / multiplier 2 where Mailbox wins.** Upstream reached the same conclusion and deleted the option (section 0.6).
 
+### 2.1 The underlying rule, and why "limiter off" is not one setting
+
+The case 1 vs case 5 gap is often misread as "in-game limiter on beats in-game limiter off." It is not. The general rule is:
+
+> **Exactly one deadline limiter, placed as close to the input-sampling point as possible.** Zero deadline limiters (backpressure only) is the worst case. Two active limiters at the same target is frame-pacing jitter.
+
+Case 5 is bad not because a checkbox is off, but because **no deadline limiter exists anywhere in the chain** — the only thing holding base FPS at 30 is FIFO backpressure blocking in `vkAcquireNextImageKHR` (section b2). "Render ahead, then stall" means every displayed frame was sampled 2–3 output intervals ago.
+
+**This is why the Deck conclusion does not generalize to "always enable the in-game limiter."** On the Deck the in-game limiter is usually the *only* deadline limiter available, so case 1 and "limiter on" happen to coincide. Change the platform and they separate.
+
+#### Worked counter-example: desktop, driver-side cap, no FG
+
+Config: RTX 5070 Ti / 9700X, Nvidia App driver-level cap at 60, frame generation **off**.
+
+Here the driver cap **is** an active deadline limiter — it sleeps the pipeline to a wall-clock target, and with Reflex it also performs render-queue reduction. So switching the in-game limiter off does **not** produce case 5; the chain still contains exactly one proper limiter. In this document's taxonomy the config is a **case 1/3 analogue, not case 5.**
+
+Correct in-game limiter setting: **off**, or a few FPS *above* the driver cap (63–65) purely as a menu/loading-screen fallback. Setting it *at* 60 makes two limiters contend; setting it *below* 60 makes it the binding one, which silently discards the driver limiter's Reflex-based pacing.
+
+Companion settings for a 60 cap with no FG:
+
+- **Reflex: On** (not "On + Boost") — cooperates with the driver cap; this is the dominant latency term.
+- Driver **Low Latency Mode: Off** when Reflex is available in-game; **Ultra** only for titles without Reflex.
+- **With G-Sync/VRR:** G-Sync on, V-Sync on in the driver, cap comfortably under refresh — lowest-latency tear-free configuration.
+- **Without VRR:** V-Sync off; consider 58–59 rather than exactly 60 to avoid brushing the refresh ceiling.
+
+#### ⚠ What does not transfer
+
+Every latency figure in section 2 assumes **FG is active**, so the unavoidable ~16.7 ms interpolation hold-back (component 2) is baked into every row, including the ~55 ms case 1 baseline. A no-FG desktop config does not pay that term at all. **Only the limiter-placement logic transfers across platforms; the absolute magnitudes do not.**
+
 ## 3. Recommended configuration
 
 In-game limiter → 30; FrameCap slider → Off; Present Mode → FIFO.
@@ -695,6 +724,35 @@ Deck 的 CPU 和 GPU 共用一份功耗预算。case 5 中模拟循环从不被�
 本文档早先的版本把 case 1 vs case 2 当作一个真实取舍（Mailbox：功耗更差、延迟更好）。**源码复核否定了这一判断。** 在 gamescope 下 Mailbox 的延迟优势接近于零（b-deck），而它的代价是三个独立机制（b1 浪费算力、b2 失去节流、b3 抖动）而非一个。因此 Mailbox 在本硬件上也接近于被严格支配。
 
 **推荐 case 1；在 60Hz + 倍率 2 的条件下，不存在任何让 Mailbox 取胜的配置。** 上游得出了同样的结论并删除了该选项（见 0.6 节）。
+
+### 2.1 底层规则，以及为什么"关闭限帧"不是一个设置
+
+case 1 与 case 5 的差距常被误读为"开游戏内限帧优于关游戏内限帧"。并非如此。通用规则是：
+
+> **整条链路上恰好有一个截止时间型限帧器，且尽可能靠近输入采样点。** 零个截止时间型限帧器（仅靠背压）是最差情形。两个同时生效、目标相同的限帧器会造成帧间隔抖动。
+
+case 5 之所以糟糕，不是因为某个勾选框被关掉，而是因为**整条链路上不存在任何截止时间型限帧器**——把基础帧率压在 30 的唯一机制是 FIFO 背压阻塞在 `vkAcquireNextImageKHR`（见 b2 节）。"提前渲染，然后停顿"意味着你看到的每一帧都是 2~3 个输出间隔之前采样的。
+
+**这就是为什么 Deck 上的结论不能推广成"永远开启游戏内限帧"。** 在 Deck 上，游戏内限帧器通常是*唯一*可用的截止时间型限帧器，于是 case 1 与"开限帧"恰好重合。换个平台，两者就分离了。
+
+#### 反例推演：桌面平台、驱动层限帧、不开 FG
+
+配置：RTX 5070 Ti / 9700X，Nvidia App 驱动层限帧 60，帧生成**关闭**。
+
+此处驱动层限帧**本身就是**一个生效中的截止时间型限帧器——它把管线睡到墙钟目标时间，配合 Reflex 还会做渲染队列缩减。因此关闭游戏内限帧**不会**产生 case 5，链路中依然恰好有一个正规限帧器。按本文档的分类，该配置是 **case 1/3 的类比，而非 case 5。**
+
+游戏内限帧器的正确设置：**关闭**，或设为略*高于*驱动上限的值（63~65），纯粹作为菜单/加载画面的兜底。设成*正好* 60 会让两个限帧器互相争抢；设成*低于* 60 则它成为实际生效的那个，从而静默丢弃驱动限帧器基于 Reflex 的调度。
+
+60 上限、不开 FG 时的配套设置：
+
+- **Reflex：开**（不是"开 + Boost"）——与驱动上限协同工作；这是延迟的主导项。
+- 游戏内有 Reflex 时，驱动的 **Low Latency Mode 设为 Off**；仅对没有 Reflex 的游戏才用 **Ultra**。
+- **有 G-Sync/VRR**：G-Sync 开，驱动内 V-Sync 开，上限留出足够余量低于刷新率——这是延迟最低的无撕裂配置。
+- **无 VRR**：V-Sync 关；可考虑设 58~59 而非正好 60，避免贴着刷新率上限。
+
+#### ⚠ 哪些结论无法迁移
+
+第 2 节所有延迟数值都以 **FG 已生效**为前提，因此不可避免的约 16.7ms 插值滞留（第 2 项）被计入了每一行，包括 case 1 那个约 55ms 的基准。不开 FG 的桌面配置完全不付这一项。**跨平台可迁移的只有限帧器放置逻辑，绝对数值不可迁移。**
 
 ## 3. 推荐配置
 
