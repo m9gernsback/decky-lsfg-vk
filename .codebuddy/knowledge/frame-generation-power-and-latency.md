@@ -502,6 +502,101 @@ So "the framerate didn't go up" may be partly an overlay artifact rather than a 
 - **Perceived motion smoothness.**
 - **GPU power draw.** Interpolation costs `I` per frame and cannot be free. Note the baseline here is *same base FPS with the layer inactive* (`30R` vs `30R + 30I`) — not native 60 (`60R`), which is the different comparison in section 1.0. Against a same-base-FPS baseline, an engaged layer always draws more. So: flat power + flat FPS = layer genuinely not running (go to 8.1/8.2). Raised power + flat FPS = layer running, overlay misreporting (or the Mailbox b1 pathology from section 1).
 
+### 8.6 Display mode (Fullscreen vs Windowed-Fullscreen): a non-issue for the layer
+
+**Verdict for Steam Deck gamemode: no practical difference.** Neither mode changes what lsfg-vk does.
+
+**Why the layer doesn't care.** In gamemode there is no true exclusive fullscreen — gamescope owns the panel, and the game's "fullscreen" is a virtualized Windows/DXGI concept. Both exclusive-fullscreen and borderless end up as the game presenting Vulkan frames to gamescope, which composites at the panel's refresh rate. The layer hooks the game's Vulkan swapchain, which exists identically in both modes, so the present path (game → layer → gamescope) and everything in sections 1–2 (power, latency, pacing) is unaffected by the choice.
+
+**Upstream's only display-mode guidance is not about the Deck.** `Troubleshooting.md` (current `develop`) contains exactly one such line — *"(When using `pacing_mode = none` on Wayland): Try running in windowed mode"* — aimed at desktop Wayland compositors with tearing control / direct passthrough. Under gamescope it is moot.
+
+**Where the choice still matters — indirectly, via the game:**
+
+1. **V-Sync availability.** Some engines only expose or only honor vsync in exclusive fullscreen. Since the layer depends on FIFO backpressure for pacing (b2, 8.3), pick whichever mode actually delivers a working vsync in that title. If exclusive-fullscreen vsync is broken, borderless is fine — gamescope's composite forces vsync at the output stage regardless.
+2. **Resolution/scaling behavior.** Exclusive fullscreen at non-native resolution hands scaling to gamescope (stretch/fit/FSR per QAM). The layer interpolates at the game's render resolution either way; scaling happens downstream and does not interact with FG. Be aware of which component scales, so you don't stack gamescope FSR on top of in-game upscaling (which per 8.3 must be off anyway).
+
+**Rule of thumb:** default to borderless/windowed-fullscreen; switch to exclusive fullscreen only if a specific game's vsync or frame pacing is broken in borderless.
+
+## 9. How MAKO caps frames instead (in-layer deadline pacer)
+
+MAKO (`/mnt/e/GitHub/MAKO`, fork of this plugin + lsfg-vk) **replaces** the env-var approach described in sections 0 and 4 with a deadline limiter built into the Vulkan layer itself. The plugin carries an explicit migration: "Move the former DXVK-only wrapper cap into engine profiles… so DirectX games are not limited twice" (`MAKO/plugin/py_modules/mako_plugin/configuration.py:361-367`); `DXVK_FRAME_RATE` is listed under `_OBSOLETE_WRAPPER_EXPORTS` (`configuration.py:52`).
+
+### 9.1 Mechanism (source-verified)
+
+1. **The cap is a profile field consumed by the layer, not a launch-script env var.** `base_fps_cap` and `adaptive_auto_base_fps_cap` live in the per-game profile the layer reads directly, same class of field as `multiplier` — not exported to DXVK/vkd3d.
+2. **The limiter sleeps inside `vkQueuePresentKHR`.** In `Swapchain::present` (`MAKO/engine/mako-render/src/swapchain.cpp:1756-1761`):
+   ```cpp
+   const auto limiterDeadline = this->realFramePacer.schedule(
+       limiterArrival, effectiveBaseFpsCap(this->profile));
+   if (limiterDeadline > limiterArrival)
+       std::this_thread::sleep_until(limiterDeadline);
+   ```
+3. **Absolute cadence, late frames rebase.** `RealFramePacer` (`MAKO/engine/mako-render/src/presentation_policy.hpp:234-279`): if the game is early it sleeps to the next slot; if `now >= nextFrameAt` it rebases from now, so a loading stall cannot create a burst of catch-up presents.
+4. **Derived effective cap** (`profile_update.hpp:31-39`): adaptive mode + auto-cap → `max(10, target_fps / 2)`, guaranteeing a steady ≥2x baseline; otherwise the explicit `base_fps_cap`.
+5. **Output-side budgeting is separate.** `FixedRefreshBudget` (`presentation_policy.hpp:284-345`) suppresses *generated* frames beyond the measured Gamescope refresh, so output stays ≤ display refresh while the pacer caps the base rate.
+6. **Live-updatable:** cap changes apply via `realFramePacer.reset()` on config reload (`swapchain.cpp:1468-1469`), no game restart.
+
+### 9.2 Why this dominates the env-var approach
+
+Against the failure modes catalogued in sections 0 and 4:
+
+- **API-agnostic.** Works identically for D3D9/10/11, DX12, native Vulkan, and Zink/GL — no `DXVK_FRAME_RATE` vs `VKD3D_FRAME_RATE` reach problem, no silent no-op on DX12 or Vulkan.
+- **Cannot be overridden at runtime.** The sleep is in the layer's own present hook, not in DXVK/vkd3d config that a game's `SetTargetFrameRate` can overwrite (the `has_user_override` asymmetry of section 4).
+- **It is a section-2.1-compliant deadline limiter** — sleep-to-deadline, latest-possible input sampling — and it is *exactly one* limiter in the chain, instead of a DXVK cap contending with an in-game cap.
+- **No silent-drop hazard.** Section 5's problem (unknown keys dropped from `~/lsfg` on rewrite) disappears; the cap lives in the profile TOML the plugin owns.
+
+### 9.3 Caveat: placement is present-stage, not engine-loop
+
+The sleep happens in the present call, so CPU run-ahead resembles **case 3** (DXVK limiter) more than **case 1** (in-game limiter): simulation can run slightly ahead before the throttle propagates back. A good in-game limiter remains preferable when one exists; the in-layer cap is the universal fallback that always works, and unlike the plugin's FrameCap slider it works on every API.
+
+## 10. MAKO and input latency: stall removal, not baseline reduction
+
+Source-verified against `/mnt/e/GitHub/MAKO/engine/mako-render/src/presentation_policy.hpp`. The question "does MAKO reduce input latency vs decky-lsfg-vk with an in-game or DXVK 30 cap?" has a clean answer: **no baseline improvement; MAKO's latency work removes spikes and pathologies.**
+
+### 10.1 Structural terms are unchanged
+
+Mapped onto the component model of section 2:
+
+- **Component 2 (the ~16.7 ms interpolation hold-back): unchanged.** MAKO uses the same licensed `Lossless.dll` models and the same interpolate-between-N-and-N+1 scheme. No MAKO setting touches this term; it is inherent to interpolation.
+- **Component 1 (sample→render, ~33 ms at 30 base): unchanged.**
+- **Component 3 (queue depth):** the `RealFramePacer` sleeps in the present hook (section 9.3), making MAKO's cap **case-3-like** — a good in-game limiter on decky-lsfg-vk (case 1) remains marginally better on CPU run-ahead. MAKO does not beat case 1.
+
+### 10.2 What MAKO actually fixes: variance and failure modes
+
+1. **Non-blocking generated-frame acquire on Gamescope** (`presentation_policy.hpp:48-59`). Upstream's blocking `UINT64_MAX` acquire for *generated* images caused **deterministic 7–13 ms stalls at 120 Hz**. MAKO's 0-timeout converts "stall the real present" into "skip the generated frame — native frame wins." This removes latency *spikes* at the cost of occasional missing generated frames — a smoothness cost, not a latency one. Note: on the ordered/SDR path the blocking acquire is deliberately retained — it is the FIFO pacing contract of section b2.
+2. **`PipelineBusyRecovery`** (`presentation_policy.hpp:136-140`): a one-frame GPU-busy result no longer invalidates temporal history; only a sustained stall (≥250 ms) triggers history warmup. Prevents quality hitches, not latency.
+3. **`FixedRefreshBudget`** (section 9.1 item 5): prevents output queue buildup above the display refresh — guards against drifting toward the case-5 latency-accumulation pathology.
+4. **`adaptive_stable_cadence`** is documented as smoother *but may increase input lag* — the one MAKO knob that moves baseline latency moves it **up**.
+
+### 10.3 Net position on the section 2 ranking
+
+MAKO ≈ **case 3** with spikes removed. decky-lsfg-vk + in-game 30 (case 1, ~55 ms) remains the latency-optimal configuration. MAKO's advantage over decky-lsfg-vk's DXVK cap is robustness — works on every API, cannot be overridden by the game — not speed. Nothing in MAKO (or lsfg-vk) can go below the case-1 floor while FG is active, because component 2 is fixed by the interpolation model itself.
+
+## 11. MAKO and ghosting: mostly a heavier configuration, not a new algorithm
+
+Source-verified against `/mnt/e/GitHub/MAKO/engine/mako-backend/src/`. MAKO's "significantly reduced ghosting" claim decomposes into a heavier default operating point plus secondary factors. The frame-generation models themselves come from the user's licensed `Lossless.dll` in both projects.
+
+### 11.1 The quality/performance split is inherited, not new
+
+MAKO's shader chains select `ctx.perf ? shaders.performance : shaders.quality` (`mako-backend/src/shaderchains/alpha0.cpp:36`, and the same pattern in beta/gamma/delta chains) — the same `performance_mode` flag decky-lsfg-vk already exposes. The model zoo is the same; what differs is the default operating point and which shader sets the build can extract.
+
+### 11.2 What actually differs (the "heavier algorithm" part)
+
+1. **Flow Scale default 0.9** (MAKO `plugin/shared_config.py`) vs **0.8** (`shared_config.py:49`). Higher flow scale = optical flow at higher resolution = better motion vectors = less ghosting/warping around moving edges — at higher GPU cost per generated frame.
+2. **Performance Mode off by default** in both, but combined with the above MAKO's shipped defaults sit at a heavier point on the quality/cost curve.
+3. **Expanded shader registry** (183 vs 171 lines in `extraction/shader_registry.cpp`) supports newer model shader sets from recent `Lossless.dll` versions — the README's "v2 model". decky-lsfg-vk's shipped build is pinned to the old `fp16-test-2` tag (`package.json:52-53`), which predates these; the "fp16" name also suggests half-precision compute that MAKO's quality path likely avoids, and precision alone can visibly affect ghosting.
+4. **HDR/high-precision model selection** (`usesHighPrecisionModel`/`usesHdrModel`, `mako-backend/src/mako.cpp:402-422`) engages only for non-SDR8 encodings (fp16 `R16G16B16A16_SFLOAT` transport vs 8-bit) — irrelevant for SDR games.
+
+In section 1.0 terms: MAKO deliberately chooses a **larger `I`** for better output — more GPU work per generated frame, a worse power equation, less headroom in heavy scenes.
+
+### 11.3 The non-algorithmic contribution: pacing
+
+Per section b3, unstable input frametimes place interpolated frames at the wrong temporal midpoint, which itself reads as ghosting/warping. MAKO's pacing work (RealFramePacer, PipelineBusyRecovery, FixedRefreshBudget — sections 9–10) stabilizes cadence, so part of the "less ghosting" is not the algorithm at all.
+
+### 11.4 Practical consequence
+
+Most of the SDR quality gap is reproducible on decky-lsfg-vk by raising Flow Scale to 0.9+ and keeping Performance Mode off, since the model comes from the user's own `Lossless.dll`. What cannot be reproduced that way: newer shader-set support (old pinned build) and possibly fp32 vs fp16 compute. MAKO's own README concedes results remain game-dependent.
+
 ---
 ---
 
@@ -1008,3 +1103,98 @@ VK_LOADER_DEBUG=layer %command%
 
 - **主观的运动流畅度。**
 - **GPU 功耗。** 插值每帧要花 `I`，不可能免费。注意这里的基线是**相同基础帧率下层未生效**（`30R` 对 `30R + 30I`），而不是原生 60（`60R`）——后者是 1.0 节中另一个比较。相对"相同基础帧率"这个基线，层一旦生效功耗必然上升。因此：功耗平、帧率平 = 层确实没跑（转 8.1/8.2）。功耗升高、帧率平 = 层在跑但叠加层显示错误（或是第 1 节所述的 Mailbox b1 病态情形）。
+
+### 8.6 显示模式（独占全屏 vs 无边框窗口）：对层而言不是问题
+
+**Steam Deck gamemode 下的结论：没有实际差别。** 两种模式都不改变 lsfg-vk 的行为。
+
+**为什么层不在乎。** gamemode 下不存在真正的独占全屏——gamescope 独占面板，游戏的"全屏"只是一个被虚拟化的 Windows/DXGI 概念。独占全屏与无边框最终都是游戏向 gamescope 呈现 Vulkan 帧，由 gamescope 按面板刷新率合成输出。层挂载在游戏的 Vulkan swapchain 上，而该 swapchain 在两种模式下完全相同，因此呈现路径（游戏 → 层 → gamescope）以及第 1~2 节的全部结论（功耗、延迟、pacing）都不受此选择影响。
+
+**上游唯一的显示模式建议并非针对 Deck。** `Troubleshooting.md`（当前 `develop`）中与此相关的只有一行——*"（使用 `pacing_mode = none` 且在 Wayland 下时）：尝试以窗口模式运行"*——针对的是启用了撕裂控制 / 直接直通的桌面 Wayland 合成器。在 gamescope 下该建议无意义。
+
+**该选择仍有影响的地方——间接地，经由游戏本身：**
+
+1. **垂直同步的可用性。** 某些引擎只在独占全屏下才提供或才遵守 vsync。由于层依赖 FIFO 背压来做 pacing（b2、8.3 节），应选能在该游戏中真正生效的 vsync 的那种模式。若独占全屏的 vsync 是坏的，无边框也完全可以——gamescope 的合成无论如何都会在输出端强制 vsync。
+2. **分辨率 / 缩放行为。** 非原生分辨率的独占全屏会把缩放交给 gamescope（按快捷菜单设置做 stretch/fit/FSR）。层始终以游戏的内部分辨率做插值，两种方式都一样；缩放发生在下游，不与 FG 交互。只需弄清是哪一层在做缩放，避免把 gamescope FSR 叠在游戏内升采样之上（后者按 8.3 节本来就应关闭）。
+
+**经验法则：** 默认用无边框 / 窗口化全屏；仅当某游戏在无边框下 vsync 或帧间隔控制失效时，才切到独占全屏。
+
+## 9. MAKO 的限帧方式（层内截止时间调度器）
+
+MAKO（`/mnt/e/GitHub/MAKO`，本插件 + lsfg-vk 的 fork）**替换**了第 0、4 节所述的环境变量方案，改为内建于 Vulkan 层的截止时间限帧器。插件中带有显式迁移逻辑："Move the former DXVK-only wrapper cap into engine profiles… so DirectX games are not limited twice"（`MAKO/plugin/py_modules/mako_plugin/configuration.py:361-367`）；`DXVK_FRAME_RATE` 被列入 `_OBSOLETE_WRAPPER_EXPORTS`（`configuration.py:52`）。
+
+### 9.1 机制（经源码核实）
+
+1. **上限是层直接读取的 profile 字段，不是启动脚本里的环境变量。** `base_fps_cap` 与 `adaptive_auto_base_fps_cap` 与 `multiplier` 同属一类字段，存于逐游戏 profile 中，不导出给 DXVK/vkd3d。
+2. **限帧器睡在 `vkQueuePresentKHR` 内部。** 见 `Swapchain::present`（`MAKO/engine/mako-render/src/swapchain.cpp:1756-1761`）：
+   ```cpp
+   const auto limiterDeadline = this->realFramePacer.schedule(
+       limiterArrival, effectiveBaseFpsCap(this->profile));
+   if (limiterDeadline > limiterArrival)
+       std::this_thread::sleep_until(limiterDeadline);
+   ```
+3. **绝对节奏，迟到帧立即重定基准。** `RealFramePacer`（`MAKO/engine/mako-render/src/presentation_policy.hpp:234-279`）：游戏提前则睡到下一个时隙；若 `now >= nextFrameAt` 则从当前时刻重定基准，加载停顿不会产生追赶式爆发。
+4. **生效上限是推导出来的**（`profile_update.hpp:31-39`）：adaptive 模式 + 自动限帧 → `max(10, target_fps / 2)`，保证稳定的 ≥2x 基线；否则用显式的 `base_fps_cap`。
+5. **输出侧预算是独立机制。** `FixedRefreshBudget`（`presentation_policy.hpp:284-345`）抑制超出实测 Gamescope 刷新率的*生成帧*，因此输出帧率 ≤ 显示刷新率，而调度器限制的是基础帧率。
+6. **可实时更新：** 上限变更经 `realFramePacer.reset()` 在配置重载时生效（`swapchain.cpp:1468-1469`），无需重启游戏。
+
+### 9.2 为什么该方案优于环境变量方案
+
+对照第 0、4 节编目的各类失效模式：
+
+- **与 API 无关。** 对 D3D9/10/11、DX12、原生 Vulkan、Zink/GL 一视同仁——不存在 `DXVK_FRAME_RATE` 与 `VKD3D_FRAME_RATE` 的作用范围问题，也不会在 DX12 或 Vulkan 上静默失效。
+- **运行时不可被覆盖。** 睡眠发生在层自己的 present 钩子里，而不是 DXVK/vkd3d 的 config——游戏调用 `SetTargetFrameRate` 无法覆盖它（即第 4 节 `has_user_override` 的不对称问题）。
+- **它是符合 2.1 节规则的截止时间型限帧器**——睡到截止时间、尽可能晚地采样输入——且链路中*恰好只有这一个*限帧器，不会出现 DXVK 限帧与游戏内限帧互相争抢。
+- **无静默丢弃风险。** 第 5 节的问题（`~/lsfg` 重写时未知键被丢弃）不复存在——上限存于插件自己拥有的 profile TOML 中。
+
+### 9.3 注意事项：挂载点在 present 阶段，而非引擎主循环
+
+睡眠发生在 present 调用中，因此 CPU 提前跑的行为更接近 **case 3**（DXVK 限帧器）而非 **case 1**（游戏内限帧器）：模拟线程可能略微提前运行，节流才反向传播回来。若游戏自带可靠的限帧器，仍然优先用它；层内限帧是"永远有效"的通用兜底——而且与插件的 FrameCap 滑块不同，它对所有 API 都有效。
+
+## 10. MAKO 与输入延迟：消除的是停顿，不是基线
+
+已对照 `/mnt/e/GitHub/MAKO/engine/mako-render/src/presentation_policy.hpp` 源码核实。"相比 decky-lsfg-vk 用游戏内或 DXVK 限 30 帧，MAKO 是否降低输入延迟？"答案很明确：**基线没有改善；MAKO 的延迟工作消除的是尖峰与病态情形。**
+
+### 10.1 结构性延迟项不变
+
+映射到第 2 节的延迟链组成：
+
+- **第 2 项（约 16.7ms 插值滞留）：不变。** MAKO 使用同一份授权的 `Lossless.dll` 模型与相同的"在 N 与 N+1 之间插值"方案。MAKO 没有任何设置能改动这一项——它是插值的固有属性。
+- **第 1 项（采样→渲染，30 基础帧时约 33ms）：不变。**
+- **第 3 项（队列深度）：** `RealFramePacer` 睡在 present 钩子里（见 9.3 节），因此 MAKO 的限帧是 **case 3 式**的——decky-lsfg-vk 配优质游戏内限帧器（case 1）在 CPU 提前跑上仍然略优。MAKO 无法胜过 case 1。
+
+### 10.2 MAKO 实际修复的：方差与失效模式
+
+1. **Gamescope 下生成帧的非阻塞 acquire**（`presentation_policy.hpp:48-59`）。上游对*生成图像*使用阻塞式 `UINT64_MAX` acquire，在 120Hz 下造成**每次 7~13ms 的确定性停顿**。MAKO 的 0 超时把"卡住真实帧的 present"变成"跳过该生成帧——原生帧优先"。这消除的是延迟*尖峰*，代价是偶尔缺一张生成帧——那是流畅度代价，不是延迟代价。注意：在 ordered/SDR 路径上阻塞式 acquire 被有意保留——那是 b2 节的 FIFO pacing 契约。
+2. **`PipelineBusyRecovery`**（`presentation_policy.hpp:136-140`）：单帧 GPU 忙不再使时序历史失效；只有持续停顿（≥250ms）才触发历史预热。防的是画质顿挫，不是延迟。
+3. **`FixedRefreshBudget`**（9.1 节第 5 条）：防止输出队列在超出显示刷新率时堆积——避免滑向 case 5 的延迟累积病态。
+4. **`adaptive_stable_cadence`** 文档明确注明更平滑*但可能增加输入延迟*——MAKO 唯一能移动基线延迟的开关，方向是**向上**。
+
+### 10.3 在第 2 节排序中的最终位置
+
+MAKO ≈ **case 3**，但尖峰被消除。decky-lsfg-vk + 游戏内限 30（case 1，约 55ms）仍是延迟最优配置。MAKO 相对 decky-lsfg-vk 的 DXVK 限帧，优势在于健壮性——对所有 API 有效、不会被游戏覆盖——而非速度。只要 FG 处于激活状态，MAKO（以及 lsfg-vk）中的任何东西都无法低于 case 1 的下限，因为第 2 项由插值模型本身固定。
+
+## 11. MAKO 与重影：主要是更重的配置，不是新算法
+
+已对照 `/mnt/e/GitHub/MAKO/engine/mako-backend/src/` 源码核实。MAKO"显著减少重影"的说法可分解为"更重的默认工作点"加若干次要因素。帧生成模型本身在两个项目中都来自用户授权的 `Lossless.dll`。
+
+### 11.1 质量/性能的模型二分是继承来的，不是新东西
+
+MAKO 的着色器链按 `ctx.perf ? shaders.performance : shaders.quality` 选择（`mako-backend/src/shaderchains/alpha0.cpp:36`，beta/gamma/delta 链同此模式）——与 decky-lsfg-vk 早已暴露的 `performance_mode` 标志相同。模型库是同一个；不同的是默认工作点以及构建能提取哪些着色器集。
+
+### 11.2 实际的差异（"更重算法"的部分）
+
+1. **Flow Scale 默认 0.9**（MAKO `plugin/shared_config.py`）对 **0.8**（`shared_config.py:49`）。更高的 flow scale = 更高分辨率的光流 = 更准的运动矢量 = 运动边缘处更少的重影/形变——代价是每张生成帧更高的 GPU 开销。
+2. **Performance Mode 两边都默认关**，但结合上一条，MAKO 的出厂默认落在质量/成本曲线上更重的一点。
+3. **扩展的着色器注册表**（`extraction/shader_registry.cpp` 183 行对 171 行）支持从较新 `Lossless.dll` 提取的新模型着色器集——即 README 所说的"v2 模型"。decky-lsfg-vk 所发布的构建钉在旧的 `fp16-test-2` 标签（`package.json:52-53`），早于这些模型；且"fp16"之名暗示半精度计算，MAKO 的质量路径很可能不用——单是精度差异就能 visibly 影响重影。
+4. **HDR/高精度模型选择**（`usesHighPrecisionModel`/`usesHdrModel`，`mako-backend/src/mako.cpp:402-422`）只在非 SDR8 编码下启用（fp16 `R16G16B16A16_SFLOAT` 传输对 8 位）——与 SDR 游戏无关。
+
+用 1.0 节的语言说：MAKO 有意选择**更大的 `I`** 换取更好的输出——每张生成帧更多 GPU 工作、更差的功耗方程、重负载场景下更少的余量。
+
+### 11.3 非算法因素的贡献：pacing
+
+按 b3 节，输入帧时间不稳会把插值帧放到错误的时间中点，其本身就会表现成重影/形变。MAKO 的 pacing 工作（RealFramePacer、PipelineBusyRecovery、FixedRefreshBudget——见第 9~10 节）稳定了节奏，因此"更少重影"中有一部分根本与算法无关。
+
+### 11.4 实践推论
+
+SDR 画质差距的大部分可以在 decky-lsfg-vk 上复现：把 Flow Scale 调到 0.9+、保持 Performance Mode 关闭即可，因为模型来自用户自己的 `Lossless.dll`。无法借此复现的是：新着色器集支持（旧构建被钉死）以及可能的 fp32 对 fp16 计算差异。MAKO 自己的 README 也承认效果因游戏而异。
