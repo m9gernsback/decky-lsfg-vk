@@ -20,6 +20,8 @@ See `py_modules/lsfg_vk/config_schema_generated.py:101-103`; the env-var name ma
 
 `DXVK_FRAME_RATE` is read by DXVK only, which implements D3D9/10/11. **For DX12, native Vulkan, and OpenGL that line is inert**, so a config that looks like "cap set" silently degenerates into "no cap".
 
+It is inert for D3D9/10/11 too on modern Proton: **`DXVK_FRAME_RATE` was removed in DXVK v3.0** (ships in Proton 10.0-3, in SteamOS since July 2026). So on a current Deck the FrameCap slider writes a variable nothing reads. See section 4 — `dxvk.maxFrameRate` is the surviving mechanism.
+
 Note the env var and the config option have *different* reach: `DXVK_FRAME_RATE` (env) does not affect DX12, but `dxvk.maxFrameRate` (config) does, via a cross-project interface. See section 4 — this distinction is easy to get wrong.
 
 **Present Mode (FIFO / Mailbox)**, by contrast, is the `experimental_present_mode` field in `conf.toml` (`shared_config.py:70-76`), applied by the lsfg-vk layer to the real swapchain.
@@ -264,15 +266,17 @@ Two caveats:
 
 ### DX12 (vkd3d-proton)
 
-Recommended set — two override-proof env vars plus one config fallback:
+Recommended set:
 
 ```bash
-export DXVK_FRAME_RATE=30
-export VKD3D_FRAME_RATE=30
-export DXVK_CONFIG="dxvk.maxFrameRate=30"
+export DXVK_CONFIG="dxvk.maxFrameRate=30"    # D3D9/10/11, plus DX12 via the DXGI vtable; survives DXVK 3.0
+export VKD3D_FRAME_RATE=30                   # DX12, override-proof (recent Proton / PR #2014)
+export DXVK_FRAME_RATE=30                    # D3D9/10/11 — DXVK ≤ 2.7 only (see warning)
 ```
 
-Lines 1–2 are the env vars for D3D9/10/11 and DX12 respectively. Line 3 is a belt-and-braces config path that also covers builds where the env var is not implemented (see below).
+⚠ **`DXVK_FRAME_RATE` was removed in DXVK v3.0** (June 2026). The release notes (commit `97fe0c6`): *"The environment variable DXVK_FRAME_RATE to enable the built-in frame rate limiter was removed. Users are encouraged to use external limiters such as those of Gamescope or Mangohud instead […] Users that wish to keep using the built-in limiter can use the configuration option `dxvk.maxFrameRate = n`."* Verified absent from DXVK master — the string appears nowhere in `src/`, `include/`, `README.md`, or `dxvk.conf`.
+
+DXVK 3.0 ships in **Proton 10.0-3** and reached SteamOS in the July 2026 preview. On a current Deck the variable is **silently ignored** — which also means **the plugin's FrameCap slider does nothing for DX games on DXVK ≥ 3.0**, since it only emits this variable. Keep the line for older Proton; `dxvk.maxFrameRate` is the version-proof mechanism for D3D9/10/11.
 
 #### Two independent paths reach the DX12 limiter
 
@@ -308,7 +312,7 @@ So if a game calls `SetTargetFrameRate` itself, or DXVK computes a refresh-deriv
 - vkd3d-proton reads **only** `VKD3D_FRAME_RATE` as an env var. The sole getenv is `libs/vkd3d/swapchain.c:3871` in `dxgi_vk_swap_chain_init_frame_rate_limiter`. **`DXVK_FRAME_RATE` is not an env-var alias** (debated in issue #1998, rejected) — the sharing happens at the config layer, not the env layer.
 - Parsed with `strtod`: `0` = uncapped, positive = capped.
 - **Sign convention:** negative means "only engage if the target is actually exceeded"; positive means hard cap. `fabs()` sets the interval, `frame_rate > 0.0` sets `enable` (`swapchain.c:1338-1344`, `dxgi_swapchain.cpp:1077-1079`). Pass positive values for a hard cap. DXVK's own per-game defaults use negatives like `-60`.
-- The env-var limiter is a relatively recent addition (PR #2014). On older Proton it is silently ignored — which is precisely when the `DXVK_CONFIG` fallback earns its place.
+- The vkd3d env-var limiter is a relatively recent addition (PR #2014). On older Proton it is silently ignored — which the `DXVK_CONFIG` path covers too, via the DXGI vtable.
 - **`dxvk.maxFrameRate` is the API-agnostic key and it takes precedence.** Documented in DXVK's shipped `dxvk.conf:94-96`, and read at `src/dxgi/dxgi_options.cpp:172-173` and `src/d3d9/d3d9_options.cpp:45-46`:
   ```cpp
   this->maxFrameRate = config.getOption<int32_t>("dxvk.maxFrameRate",
@@ -340,6 +344,8 @@ INFO("Set target frame rate to %.1lf FPS.\n", ...)                  // swapchain
 
 `just watch` (journalctl on the Deck) shows these. Seeing only the second message means the env var was not picked up and only the overridable config path is active — a game could still overwrite your cap.
 
+**Direct base-rate check (D3D9/10/11 only):** run with `DXVK_HUD=fps`. The DXVK HUD measures at the D3D level, *before* lsfg-vk, so it reads the true base rate — 30 if the cap engaged. The Steam overlay and other post-FG counters show output and **cannot distinguish "cap worked" from "cap absent"** (both read 60; see section 8.5). There is no vkd3d equivalent for DX12 — use the log lines above. To confirm `DXVK_CONFIG` was delivered at all, grep the Proton log (`PROTON_LOG=1`) for `Found config env`, printed when DXVK parses the variable (`src/util/config/config.cpp:1785`).
+
 **Placement:** `DXVK_CONFIG` and `VKD3D_FRAME_RATE` are both unknown keys to the plugin's script parser and will be **silently dropped** on the next config write (see section 5). Put them in Steam launch options, not in `~/lsfg`.
 
 ### Native Vulkan
@@ -357,7 +363,16 @@ export MANGOHUD_CONFIG=fps_limit=30,fps_limit_method=early
 
 Use `early` (wait *before* present) rather than `late`. `late` optimizes for latency, but `early` gives smoother frametimes, which matters far more here — FG amplifies base-frame jitter into visible artifacts, since unstable input frametimes mean the interpolated frame is placed at the wrong temporal position.
 
-**The trap you must check:** layer ordering between MangoHud and lsfg-vk is decided by the Vulkan loader and is not reliably user-controllable. If MangoHud ends up *outside* lsfg-vk it sees post-FG presents and caps the **output** to 30 — giving 15 base × 2 = 30, far worse than no cap at all. Verify empirically: after setting `fps_limit=30`, confirm base 30 / output 60, not base 15 / output 30. If the latter, MangoHud cannot serve as a base limiter for that title; fall back to the in-game limiter.
+**The trap, sharpened:** layer ordering between MangoHud and lsfg-vk is decided by the Vulkan loader and there is **no supported knob to change it** — verified against Vulkan-Loader docs: `VK_LOADER_LAYERS_ENABLE` / `DISABLE` / `ALLOW` gate *which* layers load, never their order. If MangoHud lands *outside* lsfg-vk it throttles the post-FG stream: output capped at 30 while base collapses to 15 — the worst configuration on the table (halved base, heavy artifacts, large latency; worse than no cap at all).
+
+**The non-obvious part: both outcomes display "30" on MangoHud's own HUD**, because MangoHud shows the rate of the stream passing through *its* position in the chain. The counter alone cannot distinguish good from bad ordering.
+
+**Verify by base rate, not by the overlay:**
+
+- **DX9/10/11:** add `DXVK_HUD=fps` — it reads the D3D-level rate, pre-FG. **30** → good order (base 30, output 60): keep it. **15** → bad order: remove the MangoHud cap for that title and use `dxvk.maxFrameRate` instead.
+- **Native Vulkan:** no D3D-level counter exists. Discriminate by motion: good order yields smooth 60-output; bad order is a 15→30 stream and looks visibly broken (artifacts + heavy latency). If in doubt, use the in-game limiter.
+
+For DX games, prefer `dxvk.maxFrameRate` (DX12 section above): it caps at the D3D level, before the layer chain exists — no ordering question at all. MangoHud's limiter is the tool for native Vulkan / Zink only.
 
 Convenient hook: the plugin's **MangoHud Workaround** toggle already exports `MANGOHUD=1` (`config_schema_generated.py:108-109`), so with it on you only need to add the `MANGOHUD_CONFIG` line.
 
@@ -389,9 +404,20 @@ This works because the generated script ends in `exec "$@"` (`configuration.py:1
 
 ## 6. Optional durable fix
 
-To make the FrameCap slider work on DX12 directly, have `dxvk_frame_rate` emit `VKD3D_FRAME_RATE` alongside `DXVK_FRAME_RATE`: add a special case in `scripts/generate_python_boilerplate.py` following the existing `enable_wsi` → `DXVK_HDR` precedent (generation at lines 133-137, parsing at lines 78-83), then run `just generate-schema`. Roughly 6 lines, no schema change, no UI change.
+To make the FrameCap slider actually work across APIs and DXVK versions, have `dxvk_frame_rate` emit:
 
-Prefer the env var over emitting `DXVK_CONFIG="dxvk.maxFrameRate=<n>"`: per section 4 the env var sets `has_user_override` and cannot be overwritten by the game at runtime, whereas the config option can. A single `VKD3D_FRAME_RATE` line is also simpler to round-trip through the script parser than a quoted compound value.
+```bash
+export DXVK_CONFIG="dxvk.maxFrameRate=<n>"   # D3D9/10/11 + DX12-via-vtable; survives DXVK 3.0
+export VKD3D_FRAME_RATE=<n>                  # DX12, override-proof
+export DXVK_FRAME_RATE=<n>                   # D3D9/10/11 on DXVK ≤ 2.7 only
+```
+
+Same implementation route: a special case in `scripts/generate_python_boilerplate.py` following the existing `enable_wsi` → `DXVK_HDR` precedent (generation at lines 133-137, parsing at lines 78-83), then `just generate-schema`. 
+
+Two complications versus the earlier version of this plan:
+
+- **Parsing `DXVK_CONFIG` back is extra work.** The round-trip parser reads `~/lsfg` to recover state; extracting `<n>` from the compound value `dxvk.maxFrameRate=<n>` needs a small regex/int parse rather than the generic `int(value)` used for plain variables. Not hard, but more than the ~6 lines previously estimated.
+- **The `has_user_override` preference for env vars still holds for DX12** (section 4), so keep `VKD3D_FRAME_RATE`. But the old preference for env vars over `DXVK_CONFIG` on the DXVK side is moot: on DXVK ≥ 3.0 there *is* no env var. `DXVK_CONFIG` is now the primary line, not the fallback.
 
 Note: per `CODEBUDDY.md`, **never** edit `config_schema_generated.py` or `generatedConfigSchema.ts` directly — they are derived files.
 
@@ -621,6 +647,8 @@ export DXVK_FRAME_RATE=<n>
 见 `py_modules/lsfg_vk/config_schema_generated.py:101-103`，环境变量名的映射硬编码在 `scripts/generate_python_boilerplate.py:33`。
 
 `DXVK_FRAME_RATE` 只被 DXVK 读取，而 DXVK 实现的是 D3D9/10/11。**对 DX12、原生 Vulkan、OpenGL 这一行完全无效**，于是"设了限帧"的配置会静默退化成"没限帧"。
+
+而在现代 Proton 上，它对 D3D9/10/11 同样无效：**`DXVK_FRAME_RATE` 已在 DXVK v3.0 中被移除**（随 Proton 10.0-3 发布，2026 年 7 月起进入 SteamOS）。因此在当前的 Deck 上，FrameCap 滑块写入的是一个没有任何东西会读取的变量。详见第 4 节——`dxvk.maxFrameRate` 是仍然存在的机制。
 
 注意环境变量与 config 选项的作用范围**不同**：`DXVK_FRAME_RATE`（env）不作用于 DX12，但 `dxvk.maxFrameRate`（config）经由一个跨项目接口**可以**。详见第 4 节——这一区别很容易搞错。
 
@@ -866,15 +894,17 @@ case 5 之所以糟糕，不是因为某个勾选框被关掉，而是因为**�
 
 ### DX12（vkd3d-proton）
 
-推荐配置——两个不可被覆盖的环境变量，加一个 config 兜底：
+推荐配置：
 
 ```bash
-export DXVK_FRAME_RATE=30
-export VKD3D_FRAME_RATE=30
-export DXVK_CONFIG="dxvk.maxFrameRate=30"
+export DXVK_CONFIG="dxvk.maxFrameRate=30"    # D3D9/10/11，以及经 DXGI 虚表的 DX12；在 DXVK 3.0 下仍有效
+export VKD3D_FRAME_RATE=30                   # DX12，不可被覆盖（较新的 Proton / PR #2014）
+export DXVK_FRAME_RATE=30                    # D3D9/10/11 —— 仅 DXVK ≤ 2.7（见警告）
 ```
 
-第 1、2 行分别是 D3D9/10/11 与 DX12 的环境变量；第 3 行是兜底的 config 路径，可覆盖环境变量尚未实现的构建（见下）。
+⚠ **`DXVK_FRAME_RATE` 已在 DXVK v3.0（2026 年 6 月）中被移除**。发布说明（commit `97fe0c6`）原文：*"The environment variable DXVK_FRAME_RATE to enable the built-in frame rate limiter was removed. Users are encouraged to use external limiters such as those of Gamescope or Mangohud instead […] use the configuration option `dxvk.maxFrameRate = n`."* 已核实 DXVK master 中该字符串在 `src/`、`include/`、`README.md`、`dxvk.conf` 中均不存在。
+
+DXVK 3.0 随 **Proton 10.0-3** 发布，并经 2026 年 7 月的预览版进入 SteamOS。在当前 Deck 上该变量被**静默忽略**——这也意味着**插件的 FrameCap 滑块在 DXVK ≥ 3.0 下对 DX 游戏完全无效**，因为它只输出这一个变量。为旧版 Proton 保留该行即可；对 D3D9/10/11 而言，`dxvk.maxFrameRate` 才是跨版本可用的机制。
 
 #### 有两条独立路径能到达 DX12 限帧器
 
@@ -910,7 +940,7 @@ if (chain->frame_rate_limit.has_user_override)
 - vkd3d-proton 作为环境变量**只**读取 `VKD3D_FRAME_RATE`，唯一的 getenv 在 `libs/vkd3d/swapchain.c:3871` 的 `dxgi_vk_swap_chain_init_frame_rate_limiter` 中。**`DXVK_FRAME_RATE` 不是环境变量层面的别名**（issue #1998 讨论后否决）——共享发生在 config 层，而不是 env 层。
 - 用 `strtod` 解析：`0` = 不限制，正值 = 限制。
 - **符号约定**：负值表示"仅当实际帧率超过目标时才启用限帧"，正值表示硬性上限。`fabs()` 决定间隔，`frame_rate > 0.0` 决定 `enable`（`swapchain.c:1338-1344`、`dxgi_swapchain.cpp:1077-1079`）。要硬性上限就传正值。DXVK 自带的逐游戏默认值用的是 `-60` 这类负数。
-- 环境变量版限帧器是较新加入的（PR #2014）。旧 Proton 上会被静默忽略——这恰恰是 `DXVK_CONFIG` 兜底路径的价值所在。
+- vkd3d 的环境变量版限帧器是较新加入的（PR #2014）。旧 Proton 上会被静默忽略——这一缺口 `DXVK_CONFIG` 路径同样能覆盖，经由 DXGI 虚表。
 - **`dxvk.maxFrameRate` 是与 API 无关的键，且优先级更高。** 它记载于 DXVK 自带的 `dxvk.conf:94-96`，读取处为 `src/dxgi/dxgi_options.cpp:172-173` 与 `src/d3d9/d3d9_options.cpp:45-46`：
   ```cpp
   this->maxFrameRate = config.getOption<int32_t>("dxvk.maxFrameRate",
@@ -942,6 +972,8 @@ INFO("Set target frame rate to %.1lf FPS.\n", ...)                  // swapchain
 
 用 `just watch`（Deck 上的 journalctl）即可看到。若只看到第二条而没有第一条，说明环境变量没被读取、只有可被覆盖的 config 路径在起作用——游戏仍可能覆盖掉你的上限。
 
+**直接的基础帧率检查（仅 D3D9/10/11）**：加 `DXVK_HUD=fps` 运行。DXVK HUD 在 D3D 层、即 lsfg-vk *之前*测量，因此读到的是真实基础帧率——限帧生效则显示 30。Steam 覆盖层及其它 FG 之后的计数器显示的是输出，**无法区分"限帧生效"与"没有限帧"**（两种情形都显示 60；见 8.5 节）。DX12 没有 vkd3d 版的等价物——用上面的日志行。若要确认 `DXVK_CONFIG` 确实被送达，用 `PROTON_LOG=1` 并在日志中 grep `Found config env`——DXVK 解析到该变量时会打印这行（`src/util/config/config.cpp:1785`）。
+
 **放置位置**：`DXVK_CONFIG` 与 `VKD3D_FRAME_RATE` 对插件的脚本解析器都是未知键，会在下一次配置写入时被**静默丢弃**（见第 5 节）。请放进 Steam 启动选项，不要手改 `~/lsfg`。
 
 ### 原生 Vulkan
@@ -959,7 +991,16 @@ export MANGOHUD_CONFIG=fps_limit=30,fps_limit_method=early
 
 用 `early`（present *之前*等待）而非 `late`。`late` 优化延迟，但 `early` 给出更平滑的帧时间——在这里后者重要得多，因为 FG 会把基础帧的抖动放大成可见瑕疵：输入帧时间不稳定意味着插值帧被放在错误的时间位置上。
 
-**必须验证的陷阱**：MangoHud 与 lsfg-vk 的层顺序由 Vulkan loader 决定，用户无法可靠控制。若 MangoHud 排在 lsfg-vk *外侧*，它看到的是 FG 之后的 present，于是会把**输出**限制到 30 —— 变成 15 基础 × 2 = 30，比不限帧糟糕得多。实测确认：设 `fps_limit=30` 后应看到基础 30 / 输出 60，而不是基础 15 / 输出 30。若是后者，该游戏无法用 MangoHud 做基础限帧，必须回退到游戏内限帧器。
+**陷阱，进一步明确**：MangoHud 与 lsfg-vk 的层顺序由 Vulkan loader 决定，且**没有受支持的手段去改变它**——已对照 Vulkan-Loader 文档核实：`VK_LOADER_LAYERS_ENABLE` / `DISABLE` / `ALLOW` 只能决定*哪些*层被加载，从不控制顺序。若 MangoHud 排在 lsfg-vk *外侧*，被节流的是 FG 之后的流：输出被压到 30，而基础帧率塌缩到 15——这是所有方案中最糟的一种（基础帧率减半、瑕疵加重、延迟变大；比不限帧还糟）。
+
+**反直觉之处：两种情形在 MangoHud 自己的 HUD 上都显示"30"**，因为 MangoHud 显示的是流经*它所在位置*的流的速率。仅凭计数器无法区分顺序好坏。
+
+**请按基础帧率验证，而不是看叠加层**：
+
+- **DX9/10/11**：加 `DXVK_HUD=fps`——它读取 D3D 层、FG 之前的速率。读数为 **30** → 顺序正确（基础 30、输出 60），保留该配置。读数为 **15** → 顺序错误：对该游戏撤掉 MangoHud 限帧，改用 `dxvk.maxFrameRate`。
+- **原生 Vulkan**：不存在 D3D 层的计数器。凭运动表现区分：顺序正确时输出 60、运动平滑；顺序错误时是 15→30 的流，画面明显不对（瑕疵 + 明显延迟）。存疑时就用游戏内限帧器。
+
+对 DX 游戏，优先用 `dxvk.maxFrameRate`（见上文 DX12 小节）：它在 D3D 层限帧，层链尚不存在——根本没有顺序问题。MangoHud 限帧器只应留给原生 Vulkan / Zink 游戏。
 
 便利点：插件的 **MangoHud Workaround** 开关已经会导出 `MANGOHUD=1`（`config_schema_generated.py:108-109`），所以开着它的话只需再补 `MANGOHUD_CONFIG` 一行。
 
@@ -991,9 +1032,20 @@ VKD3D_FRAME_RATE=30 ~/lsfg %command%
 
 ## 6. 可选的长期修复
 
-若希望 FrameCap 滑块在 DX12 上直接生效，让 `dxvk_frame_rate` 在输出 `DXVK_FRAME_RATE` 的同时也输出 `VKD3D_FRAME_RATE`：在 `scripts/generate_python_boilerplate.py` 中加一个特例，参照已有的 `enable_wsi` → `DXVK_HDR` 先例（生成逻辑见 133-137 行，解析逻辑见 78-83 行），然后运行 `just generate-schema`。约 6 行代码，无需改 schema，无需改 UI。
+若希望 FrameCap 滑块真正跨 API、跨 DXVK 版本生效，让 `dxvk_frame_rate` 输出：
 
-优先选环境变量而不是输出 `DXVK_CONFIG="dxvk.maxFrameRate=<n>"`：按第 4 节，环境变量会置 `has_user_override`、运行时不会被游戏覆盖，而 config 选项会。并且单行 `VKD3D_FRAME_RATE` 比带引号的复合值更容易在脚本解析器里往返读写。
+```bash
+export DXVK_CONFIG="dxvk.maxFrameRate=<n>"   # D3D9/10/11 + 经虚表的 DX12；在 DXVK 3.0 下仍有效
+export VKD3D_FRAME_RATE=<n>                  # DX12，不可被覆盖
+export DXVK_FRAME_RATE=<n>                   # 仅 DXVK ≤ 2.7 的 D3D9/10/11
+```
+
+实现路径不变：在 `scripts/generate_python_boilerplate.py` 中加一个特例，参照已有的 `enable_wsi` → `DXVK_HDR` 先例（生成逻辑见 133-137 行，解析逻辑见 78-83 行），然后运行 `just generate-schema`。
+
+与早先版本方案的两点差别：
+
+- **把 `DXVK_CONFIG` 解析回来是额外工作。** 往返解析器会读 `~/lsfg` 还原状态；从 `dxvk.maxFrameRate=<n>` 这样的复合值中提取 `<n>` 需要一小段正则/整数解析，而不是普通变量那种 `int(value)`。不难，但已不止早先估计的约 6 行。
+- **环境变量在 DX12 上的 `has_user_override` 优势依然成立**（见第 4 节），所以 `VKD3D_FRAME_RATE` 要保留。但 DXVK 侧"优先环境变量而非 `DXVK_CONFIG`"的旧理由已不成立：在 DXVK ≥ 3.0 上根本*没有*这个环境变量。`DXVK_CONFIG` 现在是主线，不再是兜底。
 
 注意：按 `CODEBUDDY.md` 的约定，**绝不能**直接编辑 `config_schema_generated.py` 或 `generatedConfigSchema.ts`——它们是派生文件。
 
